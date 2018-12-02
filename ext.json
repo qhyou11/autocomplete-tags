@@ -1,0 +1,10 @@
+{
+  "identifier": "tk.myqq.autocompeltetags",
+  "name": "tags plugin",
+  "content_type": "SN|Component",
+  "area": "note-tags",
+  "version": "1.1.1",
+  "description": "tags auto.",
+  "url": "https://p4.myqq.tk",
+  "download_url": "https://github.com/qhyou11/autocomplete-tags/archive/1.1.1_n.zip"
+}
