@@ -21,54 +21,62 @@ function _classCallCheck(instance, Constructor) {
 
 var ComponentManager = function () {
   function ComponentManager(permissions, onReady) {
-    var _this = this;
-
     _classCallCheck(this, ComponentManager);
 
     this.sentMessages = [];
     this.messageQueue = [];
-    this.initialPermissions = permissions;
     this.loggingEnabled = false;
     this.acceptsThemes = true;
+    this.activeThemes = [];
+
+    this.initialPermissions = permissions;
     this.onReadyCallback = onReady;
 
     this.coallesedSaving = true;
     this.coallesedSavingDelay = 250;
 
-    var messageHandler = function messageHandler(event, mobileSource) {
-      if (_this.loggingEnabled) {
-        console.log("Components API Message received:", event.data, "mobile?", mobileSource);
-      }
-
-      // The first message will be the most reliable one, so we won't change it after any subsequent events,
-      // in case you receive an event from another window.
-      if (!_this.origin) {
-        _this.origin = event.origin;
-      }
-      _this.mobileSource = mobileSource;
-      // If from mobile app, JSON needs to be used.
-      var data = mobileSource ? JSON.parse(event.data) : event.data;
-      _this.handleMessage(data);
-    };
-
-    // Mobile (React Native) uses `document`, web/desktop uses `window`.addEventListener
-    // for postMessage API to work properly.
-
-    document.addEventListener("message", function (event) {
-      messageHandler(event, true);
-    }, false);
-
-    window.addEventListener("message", function (event) {
-      messageHandler(event, false);
-    }, false);
+    this.registerMessageHandler();
   }
 
   _createClass(ComponentManager, [{
+    key: "registerMessageHandler",
+    value: function registerMessageHandler() {
+      var _this = this;
+
+      var messageHandler = function messageHandler(event, mobileSource) {
+        if (_this.loggingEnabled) {
+          console.log("Components API Message received:", event.data, "mobile?", mobileSource);
+        }
+
+        // The first message will be the most reliable one, so we won't change it after any subsequent events,
+        // in case you receive an event from another window.
+        if (!_this.origin) {
+          _this.origin = event.origin;
+        }
+        _this.mobileSource = mobileSource;
+        // If from mobile app, JSON needs to be used.
+        var data = mobileSource ? JSON.parse(event.data) : event.data;
+        _this.handleMessage(data);
+      };
+
+      // Mobile (React Native) uses `document`, web/desktop uses `window`.addEventListener
+      // for postMessage API to work properly.
+
+      document.addEventListener("message", function (event) {
+        messageHandler(event, true);
+      }, false);
+
+      window.addEventListener("message", function (event) {
+        messageHandler(event, false);
+      }, false);
+    }
+  }, {
     key: "handleMessage",
     value: function handleMessage(payload) {
       if (payload.action === "component-registered") {
         this.sessionKey = payload.sessionKey;
         this.componentData = payload.componentData;
+
         this.onReady(payload.data);
 
         if (this.loggingEnabled) {
@@ -83,6 +91,11 @@ var ComponentManager = function () {
         var originalMessage = this.sentMessages.filter(function (message) {
           return message.messageId === payload.original.messageId;
         })[0];
+
+        if (!originalMessage) {
+          // Connection must have been reset. Alert the user.
+          alert("This extension is attempting to communicate with Standard Notes, but an error is preventing it from doing so. Please restart this extension and try again.");
+        }
 
         if (originalMessage.callback) {
           originalMessage.callback(payload.data);
@@ -123,7 +136,14 @@ var ComponentManager = function () {
 
       this.messageQueue = [];
       this.environment = data.environment;
+      this.platform = data.platform;
       this.uuid = data.uuid;
+
+      if (this.loggingEnabled) {
+        console.log("onReadyData", data);
+      }
+
+      this.activateThemes(data.activeThemeUrls || []);
 
       if (this.onReadyCallback) {
         this.onReadyCallback();
@@ -284,18 +304,21 @@ var ComponentManager = function () {
     }
   }, {
     key: "deleteItem",
-    value: function deleteItem(item) {
-      this.deleteItems([item]);
+    value: function deleteItem(item, callback) {
+      this.deleteItems([item], callback);
     }
   }, {
     key: "deleteItems",
-    value: function deleteItems(items) {
+    value: function deleteItems(items, callback) {
       var params = {
         items: items.map(function (item) {
           return this.jsonObjectForItem(item);
         }.bind(this))
       };
-      this.postMessage("delete-items", params);
+
+      this.postMessage("delete-items", params, function (data) {
+        callback && callback(data);
+      });
     }
   }, {
     key: "sendCustomEvent",
@@ -307,20 +330,50 @@ var ComponentManager = function () {
   }, {
     key: "saveItem",
     value: function saveItem(item, callback) {
-      this.saveItems([item], callback);
+      var skipDebouncer = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+
+      this.saveItems([item], callback, skipDebouncer);
     }
+
+    /* Presave allows clients to perform any actions last second before the save actually occurs (like setting previews).
+       Saves debounce by default, so if a client needs to compute a property on an item before saving, it's best to
+       hook into the debounce cycle so that clients don't have to implement their own debouncing.
+     */
+
+  }, {
+    key: "saveItemWithPresave",
+    value: function saveItemWithPresave(item, presave, callback) {
+      this.saveItemsWithPresave([item], presave, callback);
+    }
+  }, {
+    key: "saveItemsWithPresave",
+    value: function saveItemsWithPresave(items, presave, callback) {
+      this.saveItems(items, callback, false, presave);
+    }
+
+    /*
+    skipDebouncer allows saves to go through right away rather than waiting for timeout.
+    This should be used when saving items via other means besides keystrokes.
+     */
+
   }, {
     key: "saveItems",
     value: function saveItems(items, callback) {
       var _this3 = this;
 
-      items = items.map(function (item) {
-        item.updated_at = new Date();
-        return this.jsonObjectForItem(item);
-      }.bind(this));
+      var skipDebouncer = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+      var presave = arguments[3];
 
       var saveBlock = function saveBlock() {
-        _this3.postMessage("save-items", { items: items }, function (data) {
+        // presave block allows client to gain the benefit of performing something in the debounce cycle.
+        presave && presave();
+
+        var mappedItems = items.map(function (item) {
+          item.updated_at = new Date();
+          return this.jsonObjectForItem(item);
+        }.bind(_this3));
+
+        _this3.postMessage("save-items", { items: mappedItems }, function (data) {
           callback && callback();
         });
       };
@@ -334,7 +387,7 @@ var ComponentManager = function () {
          Note: it's important to modify saving items updated_at immediately and not after delay. If you modify after delay,
         a delayed sync could just be wrapping up, and will send back old data and replace what the user has typed.
       */
-      if (this.coallesedSaving == true) {
+      if (this.coallesedSaving == true && !skipDebouncer) {
         if (this.pendingSave) {
           clearTimeout(this.pendingSave);
         }
@@ -342,6 +395,8 @@ var ComponentManager = function () {
         this.pendingSave = setTimeout(function () {
           saveBlock();
         }, this.coallesedSavingDelay);
+      } else {
+        saveBlock();
       }
     }
   }, {
@@ -368,36 +423,35 @@ var ComponentManager = function () {
 
   }, {
     key: "activateThemes",
-    value: function activateThemes(urls) {
-      this.deactivateAllCustomThemes();
-
+    value: function activateThemes(incomingUrls) {
       if (this.loggingEnabled) {
-        console.log("Activating themes:", urls);
+        console.log("Incoming themes", incomingUrls);
       }
-
-      if (!urls) {
+      if (this.activeThemes.sort().toString() == incomingUrls.sort().toString()) {
+        // incoming are same as active, do nothing
         return;
       }
+
+      var themesToActivate = incomingUrls || [];
+      var themesToDeactivate = [];
 
       var _iteratorNormalCompletion2 = true;
       var _didIteratorError2 = false;
       var _iteratorError2 = undefined;
 
       try {
-        for (var _iterator2 = urls[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
-          var url = _step2.value;
+        for (var _iterator2 = this.activeThemes[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var activeUrl = _step2.value;
 
-          if (!url) {
-            continue;
+          if (!incomingUrls.includes(activeUrl)) {
+            // active not present in incoming, deactivate it
+            themesToDeactivate.push(activeUrl);
+          } else {
+            // already present in active themes, remove it from themesToActivate
+            themesToActivate = themesToActivate.filter(function (candidate) {
+              return candidate != activeUrl;
+            });
           }
-
-          var link = document.createElement("link");
-          link.href = url;
-          link.type = "text/css";
-          link.rel = "stylesheet";
-          link.media = "screen,print";
-          link.className = "custom-theme";
-          document.getElementsByTagName("head")[0].appendChild(link);
         }
       } catch (err) {
         _didIteratorError2 = true;
@@ -413,19 +467,118 @@ var ComponentManager = function () {
           }
         }
       }
+
+      if (this.loggingEnabled) {
+        console.log("Deactivating themes:", themesToDeactivate);
+        console.log("Activating themes:", themesToActivate);
+      }
+
+      var _iteratorNormalCompletion3 = true;
+      var _didIteratorError3 = false;
+      var _iteratorError3 = undefined;
+
+      try {
+        for (var _iterator3 = themesToDeactivate[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
+          var theme = _step3.value;
+
+          this.deactivateTheme(theme);
+        }
+      } catch (err) {
+        _didIteratorError3 = true;
+        _iteratorError3 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion3 && _iterator3.return) {
+            _iterator3.return();
+          }
+        } finally {
+          if (_didIteratorError3) {
+            throw _iteratorError3;
+          }
+        }
+      }
+
+      this.activeThemes = incomingUrls;
+
+      var _iteratorNormalCompletion4 = true;
+      var _didIteratorError4 = false;
+      var _iteratorError4 = undefined;
+
+      try {
+        for (var _iterator4 = themesToActivate[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+          var url = _step4.value;
+
+          if (!url) {
+            continue;
+          }
+
+          var link = document.createElement("link");
+          link.id = btoa(url);
+          link.href = url;
+          link.type = "text/css";
+          link.rel = "stylesheet";
+          link.media = "screen,print";
+          link.className = "custom-theme";
+          document.getElementsByTagName("head")[0].appendChild(link);
+        }
+      } catch (err) {
+        _didIteratorError4 = true;
+        _iteratorError4 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion4 && _iterator4.return) {
+            _iterator4.return();
+          }
+        } finally {
+          if (_didIteratorError4) {
+            throw _iteratorError4;
+          }
+        }
+      }
     }
   }, {
-    key: "deactivateAllCustomThemes",
-    value: function deactivateAllCustomThemes() {
-      var elements = document.getElementsByClassName("custom-theme");
-
-      [].forEach.call(elements, function (element) {
-        if (element) {
-          element.disabled = true;
-          element.parentNode.removeChild(element);
-        }
+    key: "themeElementForUrl",
+    value: function themeElementForUrl(url) {
+      var elements = Array.from(document.getElementsByClassName("custom-theme")).slice();
+      return elements.find(function (element) {
+        // We used to search here by `href`, but on desktop, with local file:// urls, that didn't work for some reason.
+        return element.id == btoa(url);
       });
     }
+  }, {
+    key: "deactivateTheme",
+    value: function deactivateTheme(url) {
+      var element = this.themeElementForUrl(url);
+      if (element) {
+        element.disabled = true;
+        element.parentNode.removeChild(element);
+      }
+    }
+
+    /* Theme caching is currently disabled. Might be enabled in the future if neccessary. */
+    /*
+    activateCachedThemes() {
+      let themes = this.getCachedThemeUrls();
+      let writeToCache = false;
+      if(this.loggingEnabled) { console.log("Activating cached themes", themes); }
+      this.activateThemes(themes, writeToCache);
+    }
+     cacheThemeUrls(urls) {
+      if(this.loggingEnabled) { console.log("Caching theme urls", urls); }
+      localStorage.setItem("cachedThemeUrls", JSON.stringify(urls));
+    }
+     decacheThemeUrls() {
+      localStorage.removeItem("cachedThemeUrls");
+    }
+     getCachedThemeUrls() {
+      let urls = localStorage.getItem("cachedThemeUrls");
+      if(urls) {
+        return JSON.parse(urls);
+      } else {
+        return [];
+      }
+    }
+    */
 
     /* Utilities */
 
@@ -506,29 +659,29 @@ var HomeCtrl = function HomeCtrl($rootScope, $scope, $timeout) {
           hasExactMatch = tag.content.title == tagInput;
         }
         var comps = tag.content.title.split(delimitter);
-        var _iteratorNormalCompletion3 = true;
-        var _didIteratorError3 = false;
-        var _iteratorError3 = undefined;
+        var _iteratorNormalCompletion5 = true;
+        var _didIteratorError5 = false;
+        var _iteratorError5 = undefined;
 
         try {
-          for (var _iterator3 = comps[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
-            var comp = _step3.value;
+          for (var _iterator5 = comps[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
+            var comp = _step5.value;
 
             if (comp.length && comp.toLowerCase().startsWith(tagInput.toLowerCase())) {
               return true;
             }
           }
         } catch (err) {
-          _didIteratorError3 = true;
-          _iteratorError3 = err;
+          _didIteratorError5 = true;
+          _iteratorError5 = err;
         } finally {
           try {
-            if (!_iteratorNormalCompletion3 && _iterator3.return) {
-              _iterator3.return();
+            if (!_iteratorNormalCompletion5 && _iterator5.return) {
+              _iterator5.return();
             }
           } finally {
-            if (_didIteratorError3) {
-              throw _iteratorError3;
+            if (_didIteratorError5) {
+              throw _iteratorError5;
             }
           }
         }
@@ -597,13 +750,13 @@ var HomeCtrl = function HomeCtrl($rootScope, $scope, $timeout) {
     $timeout(function () {
       var allTags = $scope.tags || [];
 
-      var _iteratorNormalCompletion4 = true;
-      var _didIteratorError4 = false;
-      var _iteratorError4 = undefined;
+      var _iteratorNormalCompletion6 = true;
+      var _didIteratorError6 = false;
+      var _iteratorError6 = undefined;
 
       try {
-        for (var _iterator4 = newTags[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
-          var tag = _step4.value;
+        for (var _iterator6 = newTags[Symbol.iterator](), _step6; !(_iteratorNormalCompletion6 = (_step6 = _iterator6.next()).done); _iteratorNormalCompletion6 = true) {
+          var tag = _step6.value;
 
           var existing = allTags.filter(function (tagCandidate) {
             return tagCandidate.uuid === tag.uuid;
@@ -621,16 +774,16 @@ var HomeCtrl = function HomeCtrl($rootScope, $scope, $timeout) {
           }
         }
       } catch (err) {
-        _didIteratorError4 = true;
-        _iteratorError4 = err;
+        _didIteratorError6 = true;
+        _iteratorError6 = err;
       } finally {
         try {
-          if (!_iteratorNormalCompletion4 && _iterator4.return) {
-            _iterator4.return();
+          if (!_iteratorNormalCompletion6 && _iterator6.return) {
+            _iterator6.return();
           }
         } finally {
-          if (_didIteratorError4) {
-            throw _iteratorError4;
+          if (_didIteratorError6) {
+            throw _iteratorError6;
           }
         }
       }
